@@ -2,10 +2,10 @@
 
 **Per-application audio + your microphone → one virtual microphone, on Windows.**
 
-MicTap captures the sound of *one specific process* (not the whole desktop), optionally mixes your
-physical microphone into it, and writes the result to a virtual audio cable. Any app that lets you
-choose a microphone — Discord, KOOK, TeamSpeak, Teams, Zoom, OBS, a browser tab — picks it up as a
-regular mic.
+MicTap captures the sound of *the applications you tick* (not the whole desktop), optionally mixes
+your physical microphone into it, and writes the result to a virtual audio cable. Any app that lets
+you choose a microphone — Discord, KOOK, TeamSpeak, Teams, Zoom, OBS, a browser tab — picks it up as
+a regular mic.
 
 <p align="center">
   <img src="assets/ui-en.png" alt="MicTap user interface" width="820">
@@ -34,7 +34,8 @@ tree** — enough to cover multi-process apps such as browsers, Electron players
 
 | | |
 | --- | --- |
-| **Process-scoped capture** | Pick the exact app; child processes and helper renderers are included, the rest of the desktop is not. |
+| **App-scoped capture** | Tick the exact apps; child processes and helper renderers are included, the rest of the desktop is not. |
+| **Multi-app mixing** | Up to eight applications can be ticked at once — a music player plus a browser plus a game — and are summed into the same output on one clock. |
 | **Live mixing with a real mic** | Application audio and a physical microphone are mixed in one engine, on one clock, so the two never drift apart. |
 | **Independent lanes** | Start/stop app audio and microphone separately; adjust each gain 0–200 %. |
 | **Single executable** | UI and audio engine in one Win32 binary. No .NET runtime, no PowerShell, no installer, no background service. |
@@ -59,8 +60,9 @@ tree** — enough to cover multi-process apps such as browsers, Electron players
 1. Install VB-CABLE and reboot.
 2. Download `MicTap.exe` from [Releases](../../releases), put it in a normal folder such as
    `%LOCALAPPDATA%\Programs\MicTap\`, and run it.
-3. In **01 App audio**, pick the app in the *Source* list, set a volume, click **Start App Audio**.
-   (Optional) in **02 Microphone**, pick your mic and click **Start Microphone**.
+3. In **01 App audio**, tick one or more apps in the *Source* list (the checkboxes), set a volume,
+   click **Start App Audio**. (Optional) in **02 Microphone**, pick your mic and click
+   **Start Microphone**.
 4. In Discord / KOOK / your meeting app: microphone = `CABLE Output (VB-Audio Virtual Cable)`,
    and turn off its automatic gain control and noise suppression.
 
@@ -68,6 +70,8 @@ tree** — enough to cover multi-process apps such as browsers, Electron players
 
 - Entries marked `●` are currently rendering audio. *Show inactive processes* lists everything else
   so you can pick an app that is not playing right now.
+- **Tick several apps to mix them** (up to eight). The ticks survive a restart — each one is remembered
+  by executable path *and* process creation time, so a recycled PID never re-binds to the wrong app.
 - Both lanes are independent; either one alone works.
 - **Detect devices** re-scans for the cable and refreshes the microphone list, **Sound settings**
   opens the Windows recording panel, **Open logs** shows the diagnostic folder.
@@ -77,19 +81,20 @@ tree** — enough to cover multi-process apps such as browsers, Electron players
 ## How it works
 
 ```
-target process (PID + child tree)
-        │  Application Loopback, 48 kHz / stereo / float32
-        ▼
-   capture client ──► deque<float> ──┐
-                                     ├─► per-frame sum ─► soft limiter ─► IAudioRenderClient
-   physical microphone (WASAPI) ─────┘                                   (CABLE Input)
-        │  shared mode, same 48 kHz / stereo / float32                        │
-        ▼                                                                     ▼
-   capture client                                                   CABLE Output ─► voice app
+ticked app #1 (PID + child tree) ─┐
+ticked app #2 (PID + child tree) ─┤   Application Loopback, 48 kHz / stereo / float32
+        …  up to eight           ─┤
+                                  ▼
+        physical microphone ──► capture client ──► deque<float> ──┐
+                                                                  ├─► per-frame sum ─► soft limiter ─► IAudioRenderClient
+                                                                  │                                     (CABLE Input)
+                                                                  │                                          │
+                                                                  ▼                                          ▼
+                                                                                            CABLE Output ─► voice app
 ```
 
-- One engine thread polls both capture clients, mixes on a single sample clock and writes to the
-  render client; the UI thread only flips atomic flags.
+- One engine thread polls every ticked capture client plus the microphone, mixes them on a single
+  sample clock and writes to the render client; the UI thread only flips atomic flags.
 - Capture and render are opened in **shared mode with `AUTOCONVERTPCM`**, so Windows owns sample
   rate conversion and the app never hand-rolls a resampler.
 - A prefetch high-water mark (~50 ms) and a drop threshold (~150 ms) bound latency and prevent
@@ -104,16 +109,16 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```text
 MicTap.exe --dump                        write the process discovery result to logs\discovery.txt
-MicTap.exe --route <PID> [seconds] [mic index]
-                                         route a process for N seconds, report to logs\route-test.txt
+MicTap.exe --route <PID[,PID…]> [seconds] [mic index]
+                                         route one or more apps for N seconds, report to logs\route-test.txt
 ```
 
 `--route` writes a report such as:
 
 ```text
-pid=12120 cable_input=FOUND
-captured_frames=179040 peak=0.653235 queued=0 open=1
-mic_frames=240480 mic_peak=0.007327 mic_open=1
+pid=37932,37964 cable_input=FOUND lanes=2
+captured_frames=276480 peak=0.791960 queued=0 open=1
+lane1_frames=276480 lane1_peak=0.791960 lane1_open=1
 ```
 
 `open=1` means the capture stream is live, `peak` proves non-silent audio is flowing,

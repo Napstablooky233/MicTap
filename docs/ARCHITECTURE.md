@@ -24,15 +24,22 @@ The UI thread never touches an audio interface, and the engine thread never touc
 
 ## 2. Sources
 
-Two `Source` objects exist for the whole session:
+`kMaxApps` (8) application lanes plus one microphone lane exist for the whole session:
 
 | Source | Opened with | Flags |
 | --- | --- | --- |
-| application audio | `ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, …)` + `IAudioClient` | `AUDCLNT_STREAMFLAGS_LOOPBACK \| AUTOCONVERTPCM \| SRC_DEFAULT_QUALITY` |
+| application audio (per ticked app) | `ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, …)` + `IAudioClient` | `AUDCLNT_STREAMFLAGS_LOOPBACK \| AUTOCONVERTPCM \| SRC_DEFAULT_QUALITY` |
 | physical microphone | `IMMDeviceEnumerator::GetDevice` → `IMMDevice::Activate(IAudioClient)` | `AUTOCONVERTPCM \| SRC_DEFAULT_QUALITY` (no loopback flag) |
 
-Both produce the same internal format — 48 kHz, stereo, `float32` — so the mixer is a plain
-per-frame addition.
+All of them produce the same internal format — 48 kHz, stereo, `float32` — so the mixer is a plain
+per-frame addition over however many lanes are open.
+
+The engine keeps a `std::vector<DWORD>` of wanted PIDs (copied under `cfgLock` once per iteration) and
+compares it with the currently open set. A difference closes every lane and reopens the wanted ones;
+this only happens on a start/stop, because the UI refuses to change the selection while the lane runs.
+Each lane carries its own `HANDLE watch` from `OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)`,
+so a target that exits is detected with `WaitForSingleObject(watch, 0)` and that one lane reports
+`Stale target` instead of the whole lane dying.
 
 ### 2.1 Why Application Loopback instead of the default loopback device
 

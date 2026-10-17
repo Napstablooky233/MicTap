@@ -6,6 +6,35 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-17
+
+Multiple applications can be captured at once. This is the first release where the app-audio lane is
+a list rather than a single choice.
+
+### Added
+
+- **Multi-app mixing.** Up to eight applications can be ticked in the source list and are summed into
+  the same output, so a music player, a browser and a game can share one virtual microphone.
+- The tick boxes are remembered across restarts in `settings.ini` (`[ui] picked=`). Each entry is keyed
+  by executable path plus process creation time, so a recycled PID never re-binds to a different
+  program.
+- `--route` accepts a comma-separated PID list (`--route 37932,37964 6`) and reports one
+  `laneN_frames / laneN_peak / laneN_open` triple per captured app.
+- `--dump` appends the stable selection key to every row, which makes tick persistence diagnosable.
+
+### Changed
+
+- The source control is now a multi-select list with native check boxes instead of a drop-down.
+- A lane that loses its target only reports `Stale target` for that lane; the other lanes keep running.
+  The whole lane stops only when every target is gone.
+- The window grew from 880×640 to 880×752 to fit the list, and the whole layout moved 116 px down.
+
+### Fixed
+
+- Rebuilding the list fired one `LVN_ITEMCHANGED` per inserted row, which overwrote the stored
+  selection mid-rebuild and dropped every tick. Notifications are now ignored while the list is
+  repopulated.
+
 ## [0.1.1] — 2026-10-17
 
 Process list cleanup; no behavioural change to the audio path.
