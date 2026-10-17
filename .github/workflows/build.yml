@@ -34,7 +34,7 @@ jobs:
           windres -I src src/MicTap.rc -O coff -o build/MicTap.res
           g++ src/MicTap.cpp build/MicTap.res \
               -std=c++17 -O2 -static -mwindows -municode \
-              -lole32 -luuid -loleaut32 -lmmdevapi -lshell32 -lgdi32 -luser32 \
+              -lole32 -luuid -loleaut32 -lmmdevapi -lshell32 -lgdi32 -luser32 -lcomctl32 \
               -o build/MicTap.exe
 
       - name: Inspect binary
