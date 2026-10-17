@@ -1,0 +1,24 @@
+# build output
+build/
+*.res
+*.o
+*.obj
+
+# runtime leftovers (the app writes these next to the exe)
+logs/
+settings.ini
+
+# local tooling / scratch
+devtools/
+downloads/
+ms-samples/
+*.wav
+*.log
+
+# IDE / OS
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini

@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+*.cmd    text eol=crlf
+*.bat    text eol=crlf
+*.rc     text eol=crlf
+*.h      text eol=lf
+*.cpp    text eol=lf
+*.md     text eol=lf
+*.yml    text eol=lf
+
+*.png    binary
+*.ico    binary
+*.exe    binary
