@@ -31,7 +31,7 @@ echo [1/2] resources
 echo [2/2] compile + link
 "%CXX%" src\MicTap.cpp build\MicTap.res ^
     -std=c++17 -O2 -static %SUBSYS% -municode ^
-    -lole32 -luuid -loleaut32 -lmmdevapi -lshell32 -lgdi32 -luser32 ^
+    -lole32 -luuid -loleaut32 -lmmdevapi -lshell32 -lgdi32 -luser32 -lcomctl32 ^
     -o build\MicTap.exe || exit /b 1
 
 for %%F in (build\MicTap.exe) do echo [ok] %%~fF  (%%~zF bytes)

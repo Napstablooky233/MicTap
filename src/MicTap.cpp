@@ -9,6 +9,7 @@
 #include <audioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -48,8 +49,8 @@
     X(BtnDetect,      L"检测设备",                                    L"Detect devices") \
     X(BtnSound,       L"系统录音设置",                                L"Sound settings") \
     X(BtnLogs,        L"打开日志目录",                                L"Open logs") \
-    X(Hint,           L"提示：勾选“显示全部进程”可手动挑选任意程序。带 ● 的条目正在输出声音。", \
-                      L"Tip: tick “Show inactive processes” to pick any app. Items marked ● are playing audio.") \
+    X(Hint,           L"提示：勾选多个应用可同时混音（最多 8 个）。带 ● 的条目正在输出声音。", \
+                      L"Tip: tick several apps to mix them at once (up to 8). Items marked ● are playing audio.") \
     X(StNoCable,      L"未检测到 CABLE Input。请安装 VB-CABLE 后点“检测设备”。", \
                       L"CABLE Input not found. Install VB-CABLE, then click “Detect devices”.") \
     X(StNoCable2,     L"未检测到 CABLE Input，请先安装 VB-CABLE。",     L"CABLE Input not found — install VB-CABLE first.") \
@@ -57,12 +58,13 @@
     X(StMixing,       L"混音中 → CABLE Output（在接收应用里选择该输入设备）", L"Mixing → CABLE Output (select it as the mic in the other app)") \
     X(StErrProc,      L"无法捕获该应用：进程可能已退出，或系统不允许捕获。", L"Cannot capture this app: it may have exited or capture is not allowed.") \
     X(StErrMic,       L"无法打开所选麦克风：设备可能被独占或已断开。",     L"Cannot open that microphone: it may be exclusive or disconnected.") \
-    X(StFound,        L"已发现 %d 项 · 捕获所选进程及其子进程",           L"%d items · captures the selected process tree") \
+    X(StFound,        L"已发现 %d 项 · 勾选要混入的应用",                L"%d items · tick the apps to mix") \
+    X(StPicked,       L"已勾选 %d 个应用",                               L"%d apps ticked") \
     X(StEmpty,        L"未发现正在播放声音的应用。启动播放后点“刷新列表”，或勾选“显示全部进程”。", \
                       L"No app is playing audio. Start playback and refresh, or tick “Show inactive processes”.") \
     X(StEmptyAll,     L"没有可列出的进程。",                            L"No processes to list.") \
     X(StNeedStop,     L"请先停止应用音频，再刷新来源列表。",              L"Stop app audio before refreshing the source list.") \
-    X(StSelectApp,    L"请从列表选择应用，或直接输入进程 PID。",          L"Pick an app from the list, or type a process PID.") \
+    X(StSelectApp,    L"请至少勾选一个应用。",                          L"Tick at least one app.") \
     X(StGainApp,      L"应用音量请输入 0–200。",                        L"App volume must be between 0 and 200.") \
     X(StGainMic,      L"麦克风音量请输入 0–200。",                      L"Mic volume must be between 0 and 200.") \
     X(StPickMic,      L"请选择一个麦克风。",                            L"Select a microphone.") \
@@ -117,7 +119,7 @@ template<class T> struct Com {
 /* ================= engine ================= */
 CRITICAL_SECTION cfgLock, errLock;
 std::wstring cfgOutId, cfgMicId;
-DWORD cfgProcPid = 0;
+std::vector<DWORD> cfgProcPids;          /* every app the user ticked */
 std::atomic<int> wantProc{0}, wantMic{0};
 std::atomic<int> stateProc{0}, stateMic{0};
 std::atomic<float> gainProc{0.6f}, gainMic{1.0f};
@@ -138,6 +140,7 @@ struct Source {
     Com<IAudioCaptureClient> cap;
     std::deque<float> q;
     HANDLE watch = nullptr;      /* target process handle, lets us notice it exiting */
+    DWORD pid = 0;               /* which process this lane captures */
     bool open = false;
     /* cross-thread readable counters (engine thread writes, UI / --route reads) */
     std::atomic<unsigned long long> captured{0};
@@ -149,12 +152,16 @@ struct Source {
         client.reset();
         if (watch) { CloseHandle(watch); watch = nullptr; }
         open = false;
+        pid = 0;
         q.clear();
         queued = 0;
     }
 };
 
-Source g_proc, g_mic;
+/* one capture lane per ticked app; every lane is mixed into CABLE Input */
+constexpr int kMaxApps = 8;
+Source g_apps[kMaxApps];
+Source g_mic;
 
 struct Render {
     Com<IAudioClient> client;
@@ -361,10 +368,11 @@ void pump(Source& s) {
 
 DWORD WINAPI engineThread(LPVOID) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    Source& proc = g_proc;
     Source& mic = g_mic;
+    std::vector<DWORD> active;               /* pids currently occupying the lanes */
+    bool laneFailed[kMaxApps] = {};
     Render out;
-    bool failedProc = false, failedMic = false;
+    bool failedMic = false;
     DWORD outRetryAt = 0;
     int outFails = 0;
     float curProc = 0.0f, curMic = 0.0f;                 /* gain ramp state */
@@ -373,13 +381,22 @@ DWORD WINAPI engineThread(LPVOID) {
 
     while (!engineStop) {
         std::wstring outId, micId;
-        DWORD pid = 0;
+        std::vector<DWORD> wanted;
         EnterCriticalSection(&cfgLock);
-        outId = cfgOutId; micId = cfgMicId; pid = cfgProcPid;
+        outId = cfgOutId; micId = cfgMicId; wanted = cfgProcPids;
         LeaveCriticalSection(&cfgLock);
+        if (wanted.size() > (size_t)kMaxApps) wanted.resize(kMaxApps);
 
         int wp = wantProc.load(), wm = wantMic.load();
-        bool needOut = wp != 0 || wm != 0;
+        if (!wp) wanted.clear();
+        bool needOut = !wanted.empty() || wm != 0;
+
+        /* the ticked set changed: drop the old lanes, they get reopened below */
+        if (wanted != active) {
+            for (int i = 0; i < kMaxApps; ++i) { g_apps[i].Close(); laneFailed[i] = false; }
+            active = wanted;
+            if (active.empty()) stateProc = 0;
+        }
 
         /* CABLE Input: open on demand, reopen with exponential backoff on failure */
         if (!out.open && needOut && GetTickCount() >= outRetryAt) {
@@ -393,15 +410,20 @@ DWORD WINAPI engineThread(LPVOID) {
         }
         if (out.open && !needOut) out.Close();
 
-        if (wp && !proc.open && !failedProc) {
-            if (openProcessSource(proc, pid)) { stateProc = 1; failedProc = false; }
-            else if (!engineStop.load()) { failedProc = true; reportError(0, StErrProc); }
+        int lanesOpen = 0;
+        for (int i = 0; i < (int)active.size(); ++i) {
+            Source& s = g_apps[i];
+            if (!s.open && !laneFailed[i] && !engineStop) {
+                if (openProcessSource(s, active[i])) { s.pid = active[i]; stateProc = 1; }
+                else if (!engineStop.load()) {
+                    laneFailed[i] = true;
+                    if (stateProc != 1) { stateProc = 2; reportError(0, StErrProc); }
+                }
+            }
+            if (s.open) ++lanesOpen;
         }
-        if (!wp) {
-            if (proc.open) proc.Close();
-            failedProc = false;
-            if (stateProc != 2) stateProc = 0;
-        }
+        if (wp && lanesOpen) stateProc = 1;
+        if (!wp && stateProc != 2) stateProc = 0;
         if (wm && !mic.open && !failedMic) {
             if (openMicSource(mic, micId)) { stateMic = 1; failedMic = false; }
             else if (!engineStop.load()) { failedMic = true; reportError(1, StErrMic); }
@@ -412,16 +434,24 @@ DWORD WINAPI engineThread(LPVOID) {
             if (stateMic != 2) stateMic = 0;
         }
 
-        if (proc.open) pump(proc);
+        for (int i = 0; i < (int)active.size(); ++i) if (g_apps[i].open) pump(g_apps[i]);
         if (mic.open) pump(mic);
 
-        /* target app exited (or its tree died): stop the lane and say so */
-        if (proc.open && proc.watch && WaitForSingleObject(proc.watch, 0) == WAIT_OBJECT_0) {
-            proc.Close();
-            wantProc = 0;
-            failedProc = true;
-            reportError(0, StStale);
+        /* a ticked app exited: retire its lane, keep the others running */
+        int lanesAlive = 0;
+        for (int i = 0; i < (int)active.size(); ++i) {
+            Source& s = g_apps[i];
+            if (!s.open) continue;
+            if (s.watch && WaitForSingleObject(s.watch, 0) == WAIT_OBJECT_0) {
+                s.Close();
+                laneFailed[i] = true;
+                stateProc = 2;
+                reportError(0, StStale);
+                continue;
+            }
+            ++lanesAlive;
         }
+        if (wp && lanesAlive == 0 && !active.empty()) { wantProc = 0; stateProc = 2; }
 
         if (out.open) {
             UINT pad = 0;
@@ -442,9 +472,12 @@ DWORD WINAPI engineThread(LPVOID) {
                             if (curMic < gm) { curMic += rampStep; if (curMic > gm) curMic = gm; }
                             else if (curMic > gm) { curMic -= rampStep; if (curMic < gm) curMic = gm; }
                             float l = 0.0f, r = 0.0f;
-                            if (proc.open && proc.q.size() >= 2) {
-                                l += proc.q[0] * curProc; r += proc.q[1] * curProc;
-                                proc.q.pop_front(); proc.q.pop_front();
+                            for (int k = 0; k < (int)active.size(); ++k) {
+                                Source& s = g_apps[k];
+                                if (s.open && s.q.size() >= 2) {
+                                    l += s.q[0] * curProc; r += s.q[1] * curProc;
+                                    s.q.pop_front(); s.q.pop_front();
+                                }
                             }
                             if (mic.open && mic.q.size() >= 2) {
                                 l += mic.q[0] * curMic; r += mic.q[1] * curMic;
@@ -454,7 +487,7 @@ DWORD WINAPI engineThread(LPVOID) {
                             dst[i * 2 + 1] = softClip(r * headroom);
                         }
                         out.render->ReleaseBuffer(free, 0);
-                        proc.queued = proc.q.size() / 2;
+                        for (int k = 0; k < (int)active.size(); ++k) g_apps[k].queued = g_apps[k].q.size() / 2;
                         mic.queued = mic.q.size() / 2;
                     }
                 }
@@ -462,7 +495,7 @@ DWORD WINAPI engineThread(LPVOID) {
         }
         Sleep(2);
     }
-    proc.Close();
+    for (int i = 0; i < kMaxApps; ++i) g_apps[i].Close();
     mic.Close();
     out.Close();
     CoUninitialize();
@@ -643,6 +676,37 @@ HBRUSH bPaper, bCard, bField, bBar, bPillOff, bPillRun, bPillWrk, bPillErr;
 HANDLE audioThread = nullptr;
 std::wstring g_root, g_outId;
 std::vector<Target> g_targets;
+std::vector<std::wstring> g_picked;      /* ticked apps, kept across refreshes and restarts */
+bool g_syncing = false;                  /* true while the list is being repopulated */
+
+std::wstring targetKey(const Target& t) {
+    wchar_t b[32]{};
+    swprintf(b, 32, L"*%08lX%08lX", t.created.dwLowDateTime, t.created.dwHighDateTime);
+    return t.path + b;
+}
+
+void savePicked() {
+    std::wstring joined;
+    for (size_t i = 0; i < g_picked.size(); ++i) { if (i) joined += L"|"; joined += g_picked[i]; }
+    std::wstring ini = g_root + L"\\settings.ini";
+    WritePrivateProfileStringW(L"ui", L"picked", joined.c_str(), ini.c_str());
+}
+
+void loadPicked() {
+    std::wstring ini = g_root + L"\\settings.ini";
+    std::vector<wchar_t> buf(8192, 0);
+    GetPrivateProfileStringW(L"ui", L"picked", L"", buf.data(), (DWORD)buf.size(), ini.c_str());
+    g_picked.clear();
+    std::wstring all = buf.data();
+    size_t start = 0;
+    for (;;) {
+        size_t bar = all.find(L'|', start);
+        std::wstring one = all.substr(start, bar == std::wstring::npos ? std::wstring::npos : bar - start);
+        if (!one.empty()) g_picked.push_back(one);
+        if (bar == std::wstring::npos) break;
+        start = bar + 1;
+    }
+}
 std::vector<std::wstring> g_micIds;
 std::wstring g_hint;
 int g_dpi = 96;
@@ -657,9 +721,9 @@ void rebuildFonts();
 /* logical (96 dpi) rectangle helper */
 struct Box { int x, y, w, h; };
 
-static const Box B_CARD1   {24,  96, 832, 176};
-static const Box B_CARD2   {24, 288, 832, 144};
-static const Box B_BAR     {24, 480, 832,  48};
+static const Box B_CARD1   {24,  96, 832, 288};
+static const Box B_CARD2   {24, 400, 832, 144};
+static const Box B_BAR     {24, 592, 832,  48};
 
 int D(int v) { return MulDiv(v, g_dpi, 96); }
 
@@ -920,43 +984,53 @@ void buildRows(bool all, std::vector<Row>& rows) {
 
 void refreshProcesses() {
     if (wantProc.load()) { setStatus(S(StNeedStop), 2); return; }
-    std::wstring keepPath;
-    FILETIME keepCreated{};
-    DWORD keepPid = 0;
-    int sel = (int)SendMessageW(procBox, CB_GETCURSEL, 0, 0);
-    if (sel >= 0 && sel < (int)g_targets.size()) {
-        keepPid = g_targets[sel].pid;
-        keepCreated = g_targets[sel].created;
-        keepPath = g_targets[sel].path;
-    }
     bool all = SendMessageW(showAll, BM_GETCHECK, 0, 0) == BST_CHECKED;
     std::vector<Row> rows;
     buildRows(all, rows);
-    SendMessageW(procBox, CB_RESETCONTENT, 0, 0);
+    /* repopulating fires one LVN_ITEMCHANGED per tick: keep the stored set intact while it runs */
+    g_syncing = true;
+    SendMessageW(procBox, LVM_DELETEALLITEMS, 0, 0);
     g_targets.clear();
-    int restore = -1;
-    for (const auto& row : rows) {
-        int idx = (int)SendMessageW(procBox, CB_ADDSTRING, 0, (LPARAM)row.label.c_str());
-        g_targets.push_back(row.target);
-        if (keepPid && row.target.pid == keepPid && row.target.path == keepPath
-            && CompareFileTime(&row.target.created, &keepCreated) == 0)
-            restore = idx;
+    int ticked = 0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = (int)i;
+        it.pszText = const_cast<LPWSTR>(rows[i].label.c_str());
+        SendMessageW(procBox, LVM_INSERTITEMW, 0, (LPARAM)&it);
+        g_targets.push_back(rows[i].target);
+        bool on = std::find(g_picked.begin(), g_picked.end(), targetKey(rows[i].target)) != g_picked.end();
+        ListView_SetCheckState(procBox, (int)i, on);
+        if (on) ++ticked;
     }
-    if (restore >= 0) SendMessageW(procBox, CB_SETCURSEL, restore, 0);
-    else if (!rows.empty() && SendMessageW(procBox, CB_GETCURSEL, 0, 0) < 0)
-        SendMessageW(procBox, CB_SETCURSEL, 0, 0);
-    SendMessageW(procBox, CB_SETITEMHEIGHT, (WPARAM)-1, D(22));
-    SendMessageW(procBox, CB_SETITEMHEIGHT, (WPARAM)0, D(24));
-    SendMessageW(procBox, CB_SETDROPPEDWIDTH, D(704), 0);
+    g_syncing = false;
     if (rows.empty()) g_hint = S(all ? StEmptyAll : StEmpty);
+    else if (ticked) g_hint = fmtStr(StPicked, ticked);
     else g_hint = fmtStr(StFound, (int)rows.size());
     updateLaneUi();
 }
 
-bool selectTarget(Target& out, std::wstring& error) {
-    int sel = (int)SendMessageW(procBox, CB_GETCURSEL, 0, 0);
-    if (sel >= 0 && sel < (int)g_targets.size()) {
-        Target t = g_targets[sel];
+/* keep the ticked set in step with the list so a refresh or a language switch keeps it */
+void syncPicked() {
+    g_picked.clear();
+    int n = (int)SendMessageW(procBox, LVM_GETITEMCOUNT, 0, 0);
+    for (int i = 0; i < n && i < (int)g_targets.size(); ++i)
+        if (ListView_GetCheckState(procBox, i)) g_picked.push_back(targetKey(g_targets[i]));
+    int ticked = (int)g_picked.size();
+    if (ticked) g_hint = fmtStr(StPicked, ticked);
+    else {
+        bool all = SendMessageW(showAll, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        g_hint = g_targets.empty() ? S(all ? StEmptyAll : StEmpty) : fmtStr(StFound, (int)g_targets.size());
+    }
+    savePicked();
+}
+
+bool pickedTargets(std::vector<Target>& out, std::wstring& error) {
+    out.clear();
+    int n = (int)SendMessageW(procBox, LVM_GETITEMCOUNT, 0, 0);
+    for (int i = 0; i < n && i < (int)g_targets.size(); ++i) {
+        if (!ListView_GetCheckState(procBox, i)) continue;
+        Target t = g_targets[i];
         if (t.verified) {
             Target now{};
             if (!identify(t.pid, now) || now.path != t.path || CompareFileTime(&now.created, &t.created) != 0) {
@@ -964,18 +1038,11 @@ bool selectTarget(Target& out, std::wstring& error) {
                 return false;
             }
         }
-        if (!t.pid) { error = S(StGone); return false; }
-        out = t;
-        return true;
+        if (!t.pid) continue;
+        out.push_back(t);
+        if ((int)out.size() >= kMaxApps) break;
     }
-    std::wstring typed = textOf(procBox);
-    size_t pos = typed.find(L"PID ");
-    std::wstring num = pos == std::wstring::npos ? typed : typed.substr(pos + 4);
-    wchar_t* end = nullptr;
-    unsigned long pid = wcstoul(num.c_str(), &end, 10);
-    if (!pid || end == num.c_str()) { error = S(StSelectApp); return false; }
-    out.pid = (DWORD)pid;
-    identify(out.pid, out);
+    if (out.empty()) { error = S(StSelectApp); return false; }
     return true;
 }
 
@@ -1029,15 +1096,16 @@ void updateLaneUi() {
 void toggleProc(HWND) {
     if (wantProc.load()) { wantProc = 0; stateProc = 0; updateLaneUi(); return; }
     if (g_outId.empty()) { setStatus(S(StNoCable2), 3); return; }
-    Target t{};
+    std::vector<Target> picks;
     std::wstring error;
-    if (!selectTarget(t, error)) { setStatus(error, 3); return; }
+    if (!pickedTargets(picks, error)) { setStatus(error, 3); return; }
     std::wstring gtext = textOf(procGain);
     wchar_t* end = nullptr;
     long gain = wcstol(gtext.c_str(), &end, 10);
     if (end == gtext.c_str() || gain < 0 || gain > 200) { setStatus(S(StGainApp), 3); return; }
     EnterCriticalSection(&cfgLock);
-    cfgProcPid = t.pid;
+    cfgProcPids.clear();
+    for (const auto& t : picks) cfgProcPids.push_back(t.pid);
     LeaveCriticalSection(&cfgLock);
     gainProc = (float)(gain / 100.0);
     EnterCriticalSection(&errLock);
@@ -1204,28 +1272,28 @@ void layoutAll(HWND w) {
     place(ID_PILL_APP,      {744,112,  96, 24});
     place(ID_LBL_SOURCE,    {40, 148,  96, 24});
     place(ID_REFRESH,       {720,144, 120, 32});
-    place(ID_CHK_ALL,       {144,184, 480, 24});
-    place(ID_LBL_GAIN_APP,  {40, 226,  96, 20});
-    place(ID_RANGE_APP,     {224,226,  64, 20});
-    place(ID_PROC_BTN,      {640,216, 200, 40});
-    place(ID_SEC2_NO,       {40, 304,  24, 24});
-    place(ID_SEC2_TITLE,    {72, 304, 320, 24});
-    place(ID_PILL_MIC,      {744,304,  96, 24});
-    place(ID_LBL_DEVICE,    {40, 340,  96, 24});
-    place(ID_LBL_GAIN_MIC,  {40, 386,  96, 20});
-    place(ID_RANGE_MIC,     {224,386,  64, 20});
-    place(ID_MIC_BTN,       {640,376, 200, 40});
-    place(ID_INFO,          {24, 448, 832, 20});
-    place(ID_STATUS,        {44, 490, 792, 28});
-    place(ID_HINT,          {24, 592, 832, 32});
+    place(ID_CHK_ALL,       {144,296, 480, 24});
+    place(ID_LBL_GAIN_APP,  {40, 342,  96, 20});
+    place(ID_RANGE_APP,     {224,342,  64, 20});
+    place(ID_PROC_BTN,      {640,332, 200, 40});
+    place(ID_SEC2_NO,       {40, 416,  24, 24});
+    place(ID_SEC2_TITLE,    {72, 416, 320, 24});
+    place(ID_PILL_MIC,      {744,416,  96, 24});
+    place(ID_LBL_DEVICE,    {40, 452,  96, 24});
+    place(ID_LBL_GAIN_MIC,  {40, 498,  96, 20});
+    place(ID_RANGE_MIC,     {224,498,  64, 20});
+    place(ID_MIC_BTN,       {640,488, 200, 40});
+    place(ID_INFO,          {24, 560, 832, 20});
+    place(ID_STATUS,        {44, 602, 792, 28});
+    place(ID_HINT,          {24, 704, 832, 32});
 
-    /* combo boxes keep their own list height */
+    /* app list, and the mic combo keeps its own drop height */
     HWND c = GetDlgItem(w, ID_PROC_BOX);
-    if (c) SetWindowPos(c, nullptr, D(144), D(144), D(568), D(220), SWP_NOZORDER | SWP_NOACTIVATE);
+    if (c) SetWindowPos(c, nullptr, D(144), D(144), D(568), D(146), SWP_NOZORDER | SWP_NOACTIVATE);
     c = GetDlgItem(w, ID_MIC_BOX);
-    if (c) SetWindowPos(c, nullptr, D(144), D(336), D(696), D(200), SWP_NOZORDER | SWP_NOACTIVATE);
-    place(ID_PROC_GAIN,     {144,220,  72, 32});
-    place(ID_MIC_GAIN,      {144,380,  72, 32});
+    if (c) SetWindowPos(c, nullptr, D(144), D(448), D(696), D(200), SWP_NOZORDER | SWP_NOACTIVATE);
+    place(ID_PROC_GAIN,     {144,336,  72, 32});
+    place(ID_MIC_GAIN,      {144,492,  72, 32});
 
     /* bottom row: chained, width measured from localized text */
     int x = 24;
@@ -1236,7 +1304,7 @@ void layoutAll(HWND w) {
         int need = measureText(w, fBody, S(it.text)) + D(32);
         if (need < D(120)) need = D(120);
         HWND b = GetDlgItem(w, it.id);
-        if (b) SetWindowPos(b, nullptr, D(x), D(544), need, D(32), SWP_NOZORDER | SWP_NOACTIVATE);
+        if (b) SetWindowPos(b, nullptr, D(x), D(656), need, D(32), SWP_NOZORDER | SWP_NOACTIVATE);
         x += MulDiv(need, 96, g_dpi) + 8;
     }
 }
@@ -1335,8 +1403,16 @@ LRESULT CALLBACK windowProc(HWND w, UINT m, WPARAM a, LPARAM b) {
         make(w, L"STATIC", S(SecApp), {72, 112, 320, 24}, ID_SEC1_TITLE, SS_LEFT | SS_CENTERIMAGE, fSec);
         pillApp = make(w, L"STATIC", S(StStopped), {744, 112, 96, 24}, ID_PILL_APP, SS_CENTER | SS_CENTERIMAGE, fBody);
         make(w, L"STATIC", S(LblSource), {40, 148, 96, 24}, ID_LBL_SOURCE, SS_LEFT | SS_CENTERIMAGE, fBody);
-        procBox = make(w, L"COMBOBOX", L"", {144, 144, 568, 220}, ID_PROC_BOX,
-            CBS_DROPDOWN | CBS_AUTOHSCROLL | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP);
+        procBox = make(w, WC_LISTVIEW, L"", {144, 144, 568, 146}, ID_PROC_BOX,
+            LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP);
+        ListView_SetExtendedListViewStyle(procBox,
+            LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        {
+            LVCOLUMNW col{};
+            col.mask = LVCF_WIDTH;
+            col.cx = D(520);
+            SendMessageW(procBox, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
+        }
         btnRefresh = make(w, L"BUTTON", S(BtnRefresh), {720, 144, 120, 32}, ID_REFRESH, BS_OWNERDRAW | WS_TABSTOP);
         showAll = make(w, L"BUTTON", S(ChkAll), {144, 184, 480, 24}, ID_CHK_ALL, BS_AUTOCHECKBOX | WS_TABSTOP);
         make(w, L"STATIC", S(LblVolume), {40, 226, 96, 20}, ID_LBL_GAIN_APP, SS_LEFT | SS_CENTERIMAGE, fBody);
@@ -1363,11 +1439,10 @@ LRESULT CALLBACK windowProc(HWND w, UINT m, WPARAM a, LPARAM b) {
         make(w, L"STATIC", S(Hint), {24, 592, 832, 32}, ID_HINT, SS_LEFT | SS_CENTERIMAGE, fSmall);
 
         /* combo metrics */
-        SendMessageW(procBox, CB_SETITEMHEIGHT, (WPARAM)-1, D(22));
-        SendMessageW(procBox, CB_SETITEMHEIGHT, (WPARAM)0, D(24));
         SendMessageW(micBox, CB_SETITEMHEIGHT, (WPARAM)-1, D(22));
         SendMessageW(micBox, CB_SETITEMHEIGHT, (WPARAM)0, D(24));
 
+        loadPicked();
         layoutAll(w);
         refreshDevices();
         refreshProcesses();
@@ -1439,6 +1514,16 @@ LRESULT CALLBACK windowProc(HWND w, UINT m, WPARAM a, LPARAM b) {
     case WM_ERASEBKGND:
         return 1;
     case WM_TIMER: updateLaneUi(); return 0;
+    case WM_NOTIFY: {
+        auto h = (LPNMHDR)b;
+        if (h && h->idFrom == ID_PROC_BOX && h->code == LVN_ITEMCHANGED) {
+            if (g_syncing) return 0;      /* the list is being rebuilt, ignore its notifications */
+            syncPicked();
+            updateLaneUi();
+            return 0;
+        }
+        break;
+    }
     case WM_DRAWITEM: {
         auto d = (DRAWITEMSTRUCT*)b;
         switch (d->CtlID) {
@@ -1448,7 +1533,8 @@ LRESULT CALLBACK windowProc(HWND w, UINT m, WPARAM a, LPARAM b) {
         case ID_REFRESH: case ID_DETECT: case ID_SOUND: case ID_LOGS:
             drawSecondaryButton(d, false); return TRUE;
         case ID_INFO: drawInfoRow(d); return TRUE;
-        case ID_PROC_BOX: case ID_MIC_BOX:
+        case ID_PROC_BOX: break;                 /* the list view paints itself */
+        case ID_MIC_BOX:
             if (d->itemID == (UINT)-1) return TRUE;   /* never let the system paint a white block */
             drawComboEntry(d);
             return TRUE;
@@ -1523,6 +1609,12 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
     }
     InitializeCriticalSection(&cfgLock);
     InitializeCriticalSection(&errLock);
+    {
+        INITCOMMONCONTROLSEX icc{};
+        icc.dwSize = sizeof(icc);
+        icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
+        InitCommonControlsEx(&icc);
+    }
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, path, MAX_PATH);
     g_root = path;
@@ -1561,6 +1653,12 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
             std::string line(n > 0 ? n - 1 : 0, '\0');
             if (n > 1) WideCharToMultiByte(CP_UTF8, 0, r.label.c_str(), -1, line.data(), n, nullptr, nullptr);
             out += line + "\n";
+            /* the tick key the settings file stores, handy when debugging selection */
+            std::wstring key = targetKey(r.target);
+            int m = WideCharToMultiByte(CP_UTF8, 0, key.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            std::string kline(m > 0 ? m - 1 : 0, '\0');
+            if (m > 1) WideCharToMultiByte(CP_UTF8, 0, key.c_str(), -1, kline.data(), m, nullptr, nullptr);
+            out += "  key=" + kline + "\n";
         }
         FILE* f = _wfopen(file.c_str(), L"wb");
         if (f) { fwrite(out.data(), 1, out.size(), f); fclose(f); }
@@ -1570,20 +1668,44 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
 
     std::wstring cmdline = GetCommandLineW();
     if (cmdline.find(L"--route") != std::wstring::npos) {
-        unsigned long pid = 0;
+        std::vector<DWORD> pids;
         int secs = 5;
         int micIndex = -1;
         size_t pos = cmdline.find(L"--route");
-        swscanf(cmdline.c_str() + pos, L"--route %lu %d %d", &pid, &secs, &micIndex);
-        if (secs < 1) secs = 5;
+        std::wstring spec = cmdline.substr(pos + 7);
+        /* --route 1234,5678 5 [micIndex] : every listed pid becomes its own lane */
+        if (!spec.empty() && spec[0] == L' ') spec = spec.substr(1);
+        while (!spec.empty() && (iswdigit(spec[0]) || spec[0] == L',')) {
+            wchar_t* end = nullptr;
+            unsigned long v = wcstoul(spec.c_str(), &end, 10);
+            if (end == spec.c_str()) break;
+            if (v) pids.push_back((DWORD)v);
+            spec = std::wstring(end);
+            if (!spec.empty() && spec[0] == L',') spec = spec.substr(1);
+            else break;
+        }
+        {
+            wchar_t* end = nullptr;
+            long s = wcstol(spec.c_str(), &end, 10);
+            if (end != spec.c_str()) {
+                if (s >= 1) secs = (int)s;
+                spec = std::wstring(end);
+                long mi = wcstol(spec.c_str(), &end, 10);
+                if (end != spec.c_str()) micIndex = (int)mi;
+            }
+        }
+        if (pids.size() > (size_t)kMaxApps) pids.resize(kMaxApps);
         std::wstring out = findCableInput();
         EnterCriticalSection(&cfgLock);
         cfgOutId = out;
-        cfgProcPid = (DWORD)pid;
+        cfgProcPids = pids;
         LeaveCriticalSection(&cfgLock);
         gainProc = 1.0f;
-        std::wstring report = L"pid=" + std::to_wstring(pid) + L" cable_input=" + (out.empty() ? L"MISSING" : L"FOUND") + L"\n";
-        if (!out.empty() && pid) {
+        std::wstring idlist;
+        for (size_t i = 0; i < pids.size(); ++i) { if (i) idlist += L","; idlist += std::to_wstring(pids[i]); }
+        std::wstring report = L"pid=" + idlist + L" cable_input=" + (out.empty() ? L"MISSING" : L"FOUND")
+            + L" lanes=" + std::to_wstring(pids.size()) + L"\n";
+        if (!out.empty() && !pids.empty()) {
             wantProc = 1;
             if (micIndex >= 0) {
                 Com<IMMDeviceEnumerator> en;
@@ -1607,10 +1729,16 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
             HANDLE th = CreateThread(nullptr, 0, engineThread, nullptr, 0, nullptr);
             if (!th) { report += L"engine_thread=FAILED\n"; }
             for (int i = 0; i < secs * 10; ++i) Sleep(100);
-            report += L"captured_frames=" + std::to_wstring(g_proc.captured.load())
-                + L" peak=" + std::to_wstring(g_proc.peak.load())
-                + L" queued=" + std::to_wstring(g_proc.queued.load())
-                + L" open=" + std::to_wstring(g_proc.open ? 1 : 0) + L"\n";
+            report += L"captured_frames=" + std::to_wstring(g_apps[0].captured.load())
+                + L" peak=" + std::to_wstring(g_apps[0].peak.load())
+                + L" queued=" + std::to_wstring(g_apps[0].queued.load())
+                + L" open=" + std::to_wstring(g_apps[0].open ? 1 : 0) + L"\n";
+            if (pids.size() > 1) {
+                for (size_t i = 1; i < pids.size(); ++i)
+                    report += L"lane" + std::to_wstring(i) + L"_frames=" + std::to_wstring(g_apps[i].captured.load())
+                        + L" lane" + std::to_wstring(i) + L"_peak=" + std::to_wstring(g_apps[i].peak.load())
+                        + L" lane" + std::to_wstring(i) + L"_open=" + std::to_wstring(g_apps[i].open ? 1 : 0) + L"\n";
+            }
             if (micIndex >= 0)
                 report += L"mic_frames=" + std::to_wstring(g_mic.captured.load())
                     + L" mic_peak=" + std::to_wstring(g_mic.peak.load())
@@ -1651,7 +1779,7 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClassW(&wc);
 
-    RECT r{0, 0, D(880), D(640)};
+    RECT r{0, 0, D(880), D(752)};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRectEx(&r, style, FALSE, 0);
     mainWin = CreateWindowExW(0, wc.lpszClassName, S(Title), style | WS_CLIPCHILDREN,
