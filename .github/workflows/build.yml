@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -25,19 +25,25 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-binutils
-          path-type: inherit
 
       - name: Build
-        shell: cmd
+        shell: msys2 {0}
         run: |
-          set "MINGW_BIN=C:\msys64\mingw64\bin"
-          call build.cmd
+          set -e
+          mkdir -p build
+          windres -I src src/MicTap.rc -O coff -o build/MicTap.res
+          g++ src/MicTap.cpp build/MicTap.res \
+              -std=c++17 -O2 -static -mwindows -municode \
+              -lole32 -luuid -loleaut32 -lmmdevapi -lshell32 -lgdi32 -luser32 \
+              -o build/MicTap.exe
 
-      - name: Show binary
+      - name: Inspect binary
         shell: pwsh
         run: |
           Get-Item build\MicTap.exe | Select-Object FullName, Length
           (Get-Item build\MicTap.exe).VersionInfo | Select-Object FileVersion, ProductName
+          $v = (Get-Item build\MicTap.exe).VersionInfo.FileVersion
+          if (-not $v) { throw 'version resource missing' }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
