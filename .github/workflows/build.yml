@@ -45,6 +45,27 @@ jobs:
           $v = (Get-Item build\MicTap.exe).VersionInfo.FileVersion
           if (-not $v) { throw 'version resource missing' }
 
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          # Exercise the console self-test paths so a released binary is never
+          # shipped without having actually run. Discovery and routing both go
+          # through the same code the UI uses.
+          Push-Location build
+          & .\MicTap.exe --dump
+          if (-not (Test-Path logs\discovery.txt)) { throw 'discovery dump was not written' }
+          $header = Get-Content logs\discovery.txt -TotalCount 1
+          Write-Host "discovery: $header"
+          if ($header -notmatch '^rows=\d+') { throw "unexpected dump header: $header" }
+          if ([int]($header -replace 'rows=','') -lt 1) { throw 'discovery found no processes' }
+
+          & .\MicTap.exe --route 999999 2
+          if (-not (Test-Path logs\route-test.txt)) { throw 'route report was not written' }
+          $report = Get-Content logs\route-test.txt
+          Write-Host ($report -join "`n")
+          if (-not ($report -match 'open=0')) { throw 'a non-existent pid was not rejected' }
+          Pop-Location
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
