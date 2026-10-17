@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cwctype>
 #include <deque>
 #include <map>
 #include <string>
@@ -779,6 +780,56 @@ std::wstring presetName(const std::wstring& exe, StrId* category) {
     return L"";
 }
 
+std::wstring clip(const std::wstring& s, size_t n) {
+    if (s.size() <= n) return s;
+    std::wstring r = s.substr(0, n);
+    while (!r.empty() && r.back() == L' ') r.pop_back();
+    return r + L"\u2026";
+}
+
+/* One raw process picked up by the scan, before identical binaries get folded. */
+struct Cand {
+    DWORD pid = 0;
+    DWORD parent = 0;
+    std::wstring exe;
+    std::wstring key;                 /* lower-cased image path, else lower-cased exe name */
+    std::wstring title;
+    std::wstring friendly;
+    StrId category = StrCount;
+    Target target;
+    bool known = false;
+    bool sounding = false;
+    bool windowed = false;
+};
+
+/* Pick the process that best represents a group of identical binaries.
+   Tree roots win over children (the loopback capture already follows the tree),
+   then a process that is really producing audio, then the oldest one - a freshly
+   spawned helper must never win over the real application. */
+size_t pickRoot(const std::vector<Cand>& cands, const std::vector<size_t>& ids) {
+    std::map<DWORD, bool> inside;
+    for (size_t i : ids) inside[cands[i].pid] = true;
+    std::vector<size_t> roots;
+    for (size_t i : ids) if (!inside.count(cands[i].parent)) roots.push_back(i);
+    if (roots.empty()) roots = ids;
+    size_t best = roots.front();
+    for (size_t i : roots) {
+        const Cand& a = cands[i];
+        const Cand& b = cands[best];
+        if (a.sounding != b.sounding) {
+            if (a.sounding) best = i;
+            continue;
+        }
+        if (a.target.verified && b.target.verified) {
+            LONG d = CompareFileTime(&a.target.created, &b.target.created);
+            if (d < 0) { best = i; continue; }
+            if (d > 0) continue;
+        }
+        if (a.pid < b.pid) best = i;
+    }
+    return best;
+}
+
 void buildRows(bool all, std::vector<Row>& rows) {
     rows.clear();
     std::vector<PROCESSENTRY32W> entries;
@@ -793,6 +844,8 @@ void buildRows(bool all, std::vector<Row>& rows) {
     std::map<DWORD, std::wstring> titles;
     collectWindows(titles);
 
+    std::vector<Cand> cands;
+    DWORD self = GetCurrentProcessId();
     for (const auto& pe : entries) {
         if (!pe.th32ProcessID) continue;
         StrId category = StrCount;
@@ -804,38 +857,66 @@ void buildRows(bool all, std::vector<Row>& rows) {
         bool windowed = wt != titles.end();
         if (!known && !sounding && !windowed && !all) continue;
         if (!known && !sounding && !windowed) {
-            DWORD self = GetCurrentProcessId();
             if (pe.th32ProcessID == self || pe.th32ProcessID == 0 || pe.th32ProcessID == 4) continue;
         }
-        bool child = false;
-        if (!known && !sounding && !windowed) {
-            for (const auto& parent : entries) {
-                if (parent.th32ProcessID == pe.th32ParentProcessID && !_wcsicmp(parent.szExeFile, pe.szExeFile)) { child = true; break; }
-            }
+        Cand c;
+        c.pid = pe.th32ProcessID;
+        c.parent = pe.th32ParentProcessID;
+        c.exe = pe.szExeFile;
+        c.category = category;
+        c.friendly = friendly;
+        c.known = known;
+        c.sounding = sounding;
+        c.windowed = windowed;
+        if (windowed) c.title = wt->second;
+        identify(pe.th32ProcessID, c.target);
+        if (!c.target.verified) c.target.pid = pe.th32ProcessID;
+        c.key = (c.target.verified && !c.target.path.empty()) ? c.target.path : pe.szExeFile;
+        for (auto& ch : c.key) ch = (wchar_t)towlower(ch);
+        cands.push_back(c);
+    }
+
+    /* Fold identical binaries into one entry: QQ and NetEase Cloud Music both run a
+       parent plus several same-image children, and listing them separately is noise. */
+    std::map<std::wstring, std::vector<size_t>> groups;
+    for (size_t i = 0; i < cands.size(); ++i) groups[cands[i].key].push_back(i);
+
+    for (auto& g : groups) {
+        const std::vector<size_t>& ids = g.second;
+        size_t root = pickRoot(cands, ids);
+        const Cand& rc = cands[root];
+        bool sounding = false, known = false, windowed = false;
+        StrId category = StrCount;
+        std::wstring friendly, title;
+        for (size_t i : ids) {
+            const Cand& c = cands[i];
+            sounding = sounding || c.sounding;
+            windowed = windowed || c.windowed;
+            if (c.known && !known) { known = true; category = c.category; friendly = c.friendly; }
+            if (title.empty() && !c.title.empty()) title = c.title;
         }
-        if (child && !all) continue;
-        Target t{};
-        identify(pe.th32ProcessID, t);
-        if (!t.verified) { t.pid = pe.th32ProcessID; }
         std::wstring label;
         label += sounding ? L"● " : L"   ";
         if (known) label += std::wstring(L"[") + S(category) + L"] " + friendly;
-        else if (windowed && wt->second.size() > 1) label += wt->second.substr(0, 40);
-        else label += pe.szExeFile;
-        label += L" · PID " + std::to_wstring(pe.th32ProcessID);
+        else if (windowed && title.size() > 1) label += clip(title, 34);
+        else label += rc.exe;
+        if (ids.size() > 1) label += L" ×" + std::to_wstring(ids.size());
+        label += L" · PID " + std::to_wstring(rc.pid);
         if (sounding) label += std::wstring(L" · ") + S(Playing);
         int rank;
         if (known && sounding) rank = 0;        /* 已知播放器正在发声：最优先 */
         else if (known) rank = 1;               /* 已知播放器但当前静音 */
         else if (sounding) rank = 2;            /* 其他正在发声的进程 */
         else rank = 3;                          /* 窗口应用 / 全部进程 */
-        rows.push_back({label, t, rank, pe.szExeFile, sounding});
+        rows.push_back({label, rc.target, rank, rc.exe, sounding});
     }
+
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
         if (a.rank != b.rank) return a.rank < b.rank;
         return a.label < b.label;
     });
 }
+
 
 void refreshProcesses() {
     if (wantProc.load()) { setStatus(S(StNeedStop), 2); return; }

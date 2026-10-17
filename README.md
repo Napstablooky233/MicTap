@@ -40,6 +40,7 @@ tree** — enough to cover multi-process apps such as browsers, Electron players
 | **Single executable** | UI and audio engine in one Win32 binary. No .NET runtime, no PowerShell, no installer, no background service. |
 | **Bilingual UI** | Chinese and English, switchable at runtime and remembered in `settings.ini`. |
 | **High-DPI aware** | Per-Monitor V2; layouts are computed from logical coordinates. |
+| **Grouped process list** | Processes sharing one executable are folded into a single row (`Microsoft Edge ×7`); the row captures the tree root, so renderers and helpers come along. |
 | **PID reuse guard** | The target is re-verified by executable path and process creation time before capture starts. |
 | **Honest failure** | A dead or vanished target reports an error instead of silently streaming silence. |
 

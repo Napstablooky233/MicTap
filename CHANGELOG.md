@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-10-17
+
+Process list cleanup; no behavioural change to the audio path.
+
+### Changed
+
+- Processes that share the same executable image are folded into a single row, annotated `×N`
+  (`Microsoft Edge ×7`, `腾讯QQ ×9`, `网易云音乐 ×3`). Browsers, Electron apps and chat clients all
+  run a parent plus helper processes, and listing each of them was noise. The row captures the root
+  process, and process-tree loopback already follows the children.
+- The row's representative process is chosen in this order: a tree root over a child, a process that
+  is actually rendering audio over one that is idle, then the oldest process — so a freshly spawned
+  helper never replaces the real application.
+- Long window titles are clipped to 34 characters with an ellipsis instead of being cut mid-word.
+
+### Fixed
+
+- A process whose only window belonged to a helper (for example a browser renderer) no longer shows
+  up as a separate entry from the browser itself.
+
 ## [0.1.0] — 2026-10-17
 
 First public release.
