@@ -1,5 +1,32 @@
 # Troubleshooting
 
+## The audio sounds muffled or flat
+
+This one is worth measuring rather than guessing, because the cable path is usually innocent.
+The 48 kHz path was measured end to end with three probe tones (100 Hz / 1 kHz / 10 kHz) played by
+a 48 kHz source, captured through process loopback, mixed and written to the cable:
+
+```text
+100 Hz  -0.6 dB
+1000 Hz -0.9 dB
+10000 Hz +0.0 dB   <- flat, no treble loss anywhere in MicTap
+```
+
+So if music sounds dull, look at the two ends:
+
+- **The voice app is filtering it.** Discord (Krisp noise suppression, echo cancellation, automatic
+  gain), KOOK, TeamSpeak and every game voice chat treat a music signal as noise. Turn all three off
+  for the microphone you selected, per app. This is by far the most common cause.
+- **The system audio enhancements are on.** Sound Control Panel → CABLE Input → Properties →
+  Enhancements: disable *Loudness Equalization* and anything else listed. Loudness Equalization is a
+  compressor; it flattens music into mush.
+- **The source itself is already dull.** Measured with the same probe tones, a 44.1 kHz file played
+  through the legacy WinMM player lost 3 dB at 10 kHz *before* MicTap ever saw it. Music players that
+  use WASAPI shared mode with a 48 kHz endpoint do not have that problem.
+- **Volume is turned down on the cable endpoint.** CABLE Input below 100 % costs level, not treble,
+  but downstream AGC in the voice app then boosts the noise floor. Keep it at 100 % and use MicTap's
+  own volume control.
+
 ## Nothing happens after clicking Start
 
 - Both lanes need a render target. If the *Detect devices* status line says the cable is missing,

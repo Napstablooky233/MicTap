@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-10-17
+
+Audio path work, driven by a "the sound is muffled" report. The cable path turned out to be flat
+(it was measured, see `docs/TROUBLESHOOTING.md`), so the changes below remove the conversions that
+were still in the chain and stop the mixer from touching the signal before it is audible.
+
+### Changed
+
+- Streams are opened **without** `AUTOCONVERTPCM` when the endpoint already runs at
+  48 kHz / stereo / float32 — the format the mixer works in. Nothing is resampled, nothing is
+  quantised a second time. Endpoints with another format still get the converter, because they need
+  it.
+- Output headroom raised from 0.85 to 0.95 (−1.4 dB → −0.45 dB), so the mix is no longer quietly
+  attenuated before it reaches the cable.
+- The clipper is now a soft knee: the last 3 % of full scale is compressed with `tanh`, everything
+  below passes untouched. Hard clipping at full scale was audible as grit on loud mixes.
+- Default application and microphone volume is 100 % instead of 60 %; the old default was quiet
+  enough that downstream voice-chat AGC would lift the noise floor.
+
+### Verified
+
+Probe tones at 100 Hz / 1 kHz / 10 kHz, 48 kHz source, measured by capturing the cable output:
+`-0.6 dB / -0.9 dB / +0.0 dB` — flat. A 44.1 kHz source played through the legacy WinMM player
+loses 3 dB at 10 kHz before MicTap sees it at all, which is why the same test used to look bad.
+
 ## [0.2.0] — 2026-10-17
 
 Multiple applications can be captured at once. This is the first release where the app-audio lane is

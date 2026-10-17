@@ -7,6 +7,7 @@
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <audioclient.h>
+#include <mmreg.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <shellapi.h>
 #include <commctrl.h>
@@ -122,7 +123,7 @@ std::wstring cfgOutId, cfgMicId;
 std::vector<DWORD> cfgProcPids;          /* every app the user ticked */
 std::atomic<int> wantProc{0}, wantMic{0};
 std::atomic<int> stateProc{0}, stateMic{0};
-std::atomic<float> gainProc{0.6f}, gainMic{1.0f};
+std::atomic<float> gainProc{1.0f}, gainMic{1.0f};
 std::atomic<bool> engineStop{false};
 std::wstring errProc, errMic;
 HWND mainWin = nullptr;
@@ -220,6 +221,37 @@ public:
     }
 };
 
+static inline bool isUnified(const WAVEFORMATEX* w) {
+    if (!w) return false;
+    if (w->nSamplesPerSec != 48000 || w->nChannels != 2 || w->wBitsPerSample != 32) return false;
+    if (w->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
+    if (w->wFormatTag == WAVE_FORMAT_EXTENSIBLE && w->cbSize >= 22) {
+        const WAVEFORMATEXTENSIBLE* e = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(w);
+        static const GUID kFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71}};
+        return IsEqualGUID(e->SubFormat, kFloat) != 0;
+    }
+    return false;
+}
+
+/* 48 kHz / stereo / float32 is what the mixer runs at, so a stream that already
+   is that format is opened without AUTOCONVERTPCM: nothing is resampled and
+   nothing is quantised again. A converter in the path is what makes audio dull. */
+static std::wstring g_srcFormat;
+
+static DWORD conversionFlags(IAudioClient* client) {
+    WAVEFORMATEX* mix = nullptr;
+    bool same = false;
+    if (client && SUCCEEDED(client->GetMixFormat(&mix)) && mix) {
+        same = isUnified(mix);
+        wchar_t buf[96];
+        swprintf(buf, 96, L"%lu/%u/%u%s", (unsigned long)mix->nSamplesPerSec, mix->nChannels,
+                 mix->wBitsPerSample, same ? L"/float" : L"/other");
+        g_srcFormat = buf;
+        CoTaskMemFree(mix);
+    }
+    return same ? 0 : AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM;
+}
+
 bool openOutput(Render& r, const std::wstring& id) {
     r.Close();
     if (id.empty()) return false;
@@ -233,7 +265,7 @@ bool openOutput(Render& r, const std::wstring& id) {
     WAVEFORMATEX f = unifiedFormat();
     if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(client.put())))) return false;
     if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            conversionFlags(client.p),
             300000, 0, &f, nullptr))) return false;
     if (FAILED(client->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(render.put())))) return false;
     if (FAILED(client->GetBufferSize(&capacity))) return false;
@@ -277,7 +309,7 @@ bool openProcessSource(Source& s, DWORD pid) {
         Com<IAudioCaptureClient> cap;
         WAVEFORMATEX f = unifiedFormat();
         if (SUCCEEDED(handler->client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | conversionFlags(handler->client.p),
                 300000, 0, &f, nullptr))
             && SUCCEEDED(handler->client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(cap.put())))
             && SUCCEEDED(handler->client->Start())) {
@@ -306,7 +338,7 @@ bool openMicSource(Source& s, const std::wstring& id) {
     WAVEFORMATEX f = unifiedFormat();
     if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(client.put())))) return false;
     if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            conversionFlags(client.p),
             300000, 0, &f, nullptr))) return false;
     if (FAILED(client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(cap.put())))) return false;
     if (FAILED(client->Start())) return false;
@@ -316,9 +348,12 @@ bool openMicSource(Source& s, const std::wstring& id) {
     return true;
 }
 
+/* only the last 3% is touched, and the knee is smooth: hard clipping at full
+   scale is audible as grit, a soft knee is not */
 static inline float softClip(float v) {
-    if (v > 1.0f) return 1.0f;
-    if (v < -1.0f) return -1.0f;
+    const float knee = 0.97f;
+    if (v > knee) return knee + (1.0f - knee) * std::tanh((v - knee) / (1.0f - knee));
+    if (v < -knee) return -knee - (1.0f - knee) * std::tanh((-v - knee) / (1.0f - knee));
     return v;
 }
 
@@ -377,7 +412,7 @@ DWORD WINAPI engineThread(LPVOID) {
     int outFails = 0;
     float curProc = 0.0f, curMic = 0.0f;                 /* gain ramp state */
     const float rampStep = 1.0f / (0.020f * 48000.0f);   /* 20ms ramp */
-    const float headroom = 0.85f;                        /* keep ~1.5dB of headroom */
+    const float headroom = 0.95f;                        /* 0.45 dB of headroom, rest goes to the knee */
 
     while (!engineStop) {
         std::wstring outId, micId;
@@ -1416,7 +1451,7 @@ LRESULT CALLBACK windowProc(HWND w, UINT m, WPARAM a, LPARAM b) {
         btnRefresh = make(w, L"BUTTON", S(BtnRefresh), {720, 144, 120, 32}, ID_REFRESH, BS_OWNERDRAW | WS_TABSTOP);
         showAll = make(w, L"BUTTON", S(ChkAll), {144, 184, 480, 24}, ID_CHK_ALL, BS_AUTOCHECKBOX | WS_TABSTOP);
         make(w, L"STATIC", S(LblVolume), {40, 226, 96, 20}, ID_LBL_GAIN_APP, SS_LEFT | SS_CENTERIMAGE, fBody);
-        procGain = make(w, L"EDIT", L"60", {144, 220, 72, 32}, ID_PROC_GAIN, WS_BORDER | ES_NUMBER | ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP, fBold);
+        procGain = make(w, L"EDIT", L"100", {144, 336, 72, 32}, ID_PROC_GAIN, WS_BORDER | ES_NUMBER | ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP, fBold);
         make(w, L"STATIC", S(RangeHint), {224, 226, 64, 20}, ID_RANGE_APP, SS_LEFT | SS_CENTERIMAGE, fSmall);
         procButton = make(w, L"BUTTON", S(BtnStartApp), {640, 216, 200, 40}, ID_PROC_BTN, BS_OWNERDRAW | WS_TABSTOP | WS_GROUP);
 
@@ -1704,7 +1739,7 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int show) {
         std::wstring idlist;
         for (size_t i = 0; i < pids.size(); ++i) { if (i) idlist += L","; idlist += std::to_wstring(pids[i]); }
         std::wstring report = L"pid=" + idlist + L" cable_input=" + (out.empty() ? L"MISSING" : L"FOUND")
-            + L" lanes=" + std::to_wstring(pids.size()) + L"\n";
+            + L" lanes=" + std::to_wstring(pids.size()) + L" src_format=" + (g_srcFormat.empty() ? L"?" : g_srcFormat) + L"\n";
         if (!out.empty() && !pids.empty()) {
             wantProc = 1;
             if (micIndex >= 0) {
