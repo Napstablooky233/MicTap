@@ -51,17 +51,27 @@ jobs:
           # Exercise the console self-test paths so a released binary is never
           # shipped without having actually run. Discovery and routing both go
           # through the same code the UI uses.
+          #
+          # MicTap.exe is a WINDOWS-subsystem binary, so a plain invocation returns
+          # immediately - Start-Process -Wait is required or the report file is not
+          # there yet when the next line runs.
           Push-Location build
-          & .\MicTap.exe --dump
-          if (-not (Test-Path logs\discovery.txt)) { throw 'discovery dump was not written' }
-          $header = Get-Content logs\discovery.txt -TotalCount 1
+          function Invoke-SelfTest([string[]]$Arguments, [string]$Report) {
+            $p = Start-Process -FilePath .\MicTap.exe -ArgumentList $Arguments -PassThru -Wait
+            Write-Host "exit code: $($p.ExitCode)"
+            if ($p.ExitCode -ne 0) { throw "MicTap.exe $Arguments exited with $($p.ExitCode)" }
+            for ($i = 0; $i -lt 40 -and -not (Test-Path $Report); $i++) { Start-Sleep -Milliseconds 250 }
+            if (-not (Test-Path $Report)) { throw "$Report was not written" }
+            return Get-Content $Report
+          }
+
+          $dump = Invoke-SelfTest @('--dump') 'logs\discovery.txt'
+          $header = $dump | Select-Object -First 1
           Write-Host "discovery: $header"
           if ($header -notmatch '^rows=\d+') { throw "unexpected dump header: $header" }
           if ([int]($header -replace 'rows=','') -lt 1) { throw 'discovery found no processes' }
 
-          & .\MicTap.exe --route 999999 2
-          if (-not (Test-Path logs\route-test.txt)) { throw 'route report was not written' }
-          $report = Get-Content logs\route-test.txt
+          $report = Invoke-SelfTest @('--route','999999','2') 'logs\route-test.txt'
           Write-Host ($report -join "`n")
           if (-not ($report -match 'open=0')) { throw 'a non-existent pid was not rejected' }
           Pop-Location
